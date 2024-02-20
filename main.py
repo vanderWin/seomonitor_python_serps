@@ -15,7 +15,6 @@ dest_file_name = os.getenv("DEST_FILE_NAME")
 
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-# Running entry point "request"
 def main(request):
 
     # Step one, fetch keyword data
