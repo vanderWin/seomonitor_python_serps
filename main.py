@@ -20,14 +20,14 @@ def main(request):
     # Step one, fetch keyword data
     # Initialise variables
     offset = 0
-    limit = 30
+    limit = 1000
     status_code = 200  # Assume initial status code to start the loop
 
     # Initialize an empty DataFrame for keywords data
     keywords_df = pd.DataFrame()
 
     while status_code == 200:
-        url = f"https://apigw.seomonitor.com/v3/rank-tracker/v3.0/keywords?campaign_id={campaign_id}&start_date={current_date}&end_date={current_date}&limit={limit}&offset={offset}"
+        url = f"https://apigw.seomonitor.com/v3/rank-tracker/v3.0/keywords?campaign_id={campaign_id}&start_date={current_date}&end_date={current_date}&limit={limit}&offset={offset}&include_all_groups=true"
 
         headers = {"Accept": "*/*", "Authorization": api_key}
         print(f"Requesting URL: {url}")
@@ -121,8 +121,8 @@ def main(request):
                 "main_keyword_id": "first",
                 "search_data.search_volume": "first",
                 "variant_flag": "first",
-                "group_name": lambda x: ", ".join(x.dropna().unique()),
-                "parent_id": lambda x: ", ".join(x.dropna().unique()),
+                "group_name": lambda x: ", ".join(map(str, x.dropna().unique())),
+                "parent_id": lambda x: ", ".join(map(str, x.dropna().unique())),
             }
         )
         .reset_index()
@@ -173,7 +173,7 @@ def main(request):
         offset = 0
         limit = 100
         status_code = 200
-        max_offset = 200  # Cap on offset for testing
+        max_offset = 10000  # Ridiculously high offset cap, just to be safe
 
         # Initialize an empty DataFrame to accumulate results
         all_serp_flat = pd.DataFrame()
@@ -213,20 +213,20 @@ def main(request):
             all_serp_flat, keywords_augmented, how="left", on="keyword_id"
         )
         final_df["campaign_id"] = campaign_id
-        final_df["Date"] = date_str
-        final_df["Device"] = device_type.capitalize()
-
-        # Rename columns to match legacy BQ schema and other transformations as needed
+        final_df["date"] = date_str
+        final_df["device"] = device_type.capitalize()
+        # Drop the 'keyword_y' column
+        final_df = final_df.drop(columns=['keyword_y'])
 
         # Determine whether to append or write new
         if append:
             final_df.to_csv(file_path, mode="a", index=False, header=False, na_rep="")
         else:
-            final_df.to_csv(file_path, index=False, na_rep="")
+            final_df.to_csv(file_path, index=False, header=False, na_rep="")
         print(f"Completed fetching and saving all {device_type} data.")
 
     # Path for the CSV file, assuming it's the same for both desktop and mobile
-    file_path = f"{campaign_id}_{date_str}_serp.csv"
+    file_path = f"{dest_file_name}.csv"
 
     # Fetch and process desktop data, write to CSV without appending (creating the file or overwriting if it exists)
     fetch_and_process_serp_data(
@@ -269,23 +269,48 @@ def main(request):
         f"File {file_path} uploaded to {destination_blob_name} in bucket {bucket_name}."
     )
 
+    # Final step, move to BQ 
     from google.cloud import bigquery
 
-    project_id = "organic-data"
+    project_id = "organic-data-361613"
     bucket_name = "rankflux"
     destination_blob_name = f"{dest_file_name}.csv"
     dataset_id = "rankflux_data"
-    table_id = campaign_id
+    table_id = f"{campaign_id}_serps"
     uri = f"gs://{bucket_name}/{destination_blob_name}"
 
     # Initialize a BigQuery client
     client = bigquery.Client(project=project_id)
 
+    # Manually define the schema
+    schema = [
+        bigquery.SchemaField("domain", "STRING"),
+        bigquery.SchemaField("rank", "INTEGER"),
+        bigquery.SchemaField("landing_page", "STRING"),
+        bigquery.SchemaField("title", "STRING"),
+        bigquery.SchemaField("description", "STRING"),
+        bigquery.SchemaField("search_intent", "STRING"),
+        bigquery.SchemaField("keyword_id", "STRING"),
+        bigquery.SchemaField("keyword", "STRING"),
+        bigquery.SchemaField("main_keyword_id", "STRING"),
+        bigquery.SchemaField("search_volume", "INTEGER"),
+        bigquery.SchemaField("variant_flag", "BOOL"),
+        bigquery.SchemaField("group_name", "STRING"),
+        bigquery.SchemaField("parent_group_id", "STRING"),
+        bigquery.SchemaField("main_keyword", "STRING"),
+        bigquery.SchemaField("campaign_id", "STRING"),
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("device", "STRING"),
+    ]
+
     # Configure the load job
     job_config = bigquery.LoadJobConfig(
-        autodetect=True,  # Let BigQuery detect the schema
+        autodetect=False,
+        schema=schema,
         source_format=bigquery.SourceFormat.CSV,
+        skip_leading_rows=0,
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        max_bad_records=10
     )
 
     # Start the load job
@@ -293,8 +318,9 @@ def main(request):
         uri, f"{dataset_id}.{table_id}", job_config=job_config
     )
 
-    # Wait for the job to complete
-    load_job.result()
-    print(f"Loaded data from {uri} into {dataset_id}.{table_id} in BigQuery.")
-
-    return "Process completed successfully"
+    try:
+        load_job.result()  # Waits for the job to complete
+        print(f"Loaded data from {uri} into {dataset_id}.{table_id} in BigQuery.")
+    except Exception as e:
+        print(f"Failed to load data from {uri} into BigQuery: {e}")
+        return "Process encountered an error"
