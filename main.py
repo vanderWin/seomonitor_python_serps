@@ -1,11 +1,15 @@
 import os
-from google.cloud import storage
-from google.cloud import bigquery
+from google.cloud import storage, bigquery
 import pandas as pd
 import requests
 import numpy as np
 from datetime import datetime
 import time
+
+# Load environment variables from .env file if present
+if os.path.exists('.env'):
+    from dotenv import load_dotenv
+    load_dotenv()
 
 api_key = os.getenv("API_KEY")
 campaign_id = os.getenv("CAMPAIGN_ID")
@@ -15,7 +19,28 @@ dest_file_name = os.getenv("DEST_FILE_NAME")
 
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-def main(request):
+# Manually define the schema
+schema = [
+    bigquery.SchemaField("domain", "STRING"),
+    bigquery.SchemaField("rank", "INTEGER"),
+    bigquery.SchemaField("landing_page", "STRING"),
+    bigquery.SchemaField("title", "STRING"),
+    bigquery.SchemaField("description", "STRING"),
+    bigquery.SchemaField("search_intent", "STRING"),
+    bigquery.SchemaField("keyword_id", "STRING"),
+    bigquery.SchemaField("keyword", "STRING"),
+    bigquery.SchemaField("main_keyword_id", "STRING"),
+    bigquery.SchemaField("search_volume", "INTEGER"),
+    bigquery.SchemaField("variant_flag", "BOOL"),
+    bigquery.SchemaField("group_name", "STRING"),
+    bigquery.SchemaField("parent_group_id", "STRING"),
+    bigquery.SchemaField("main_keyword", "STRING"),
+    bigquery.SchemaField("campaign_id", "STRING"),
+    bigquery.SchemaField("date", "DATE"),
+    bigquery.SchemaField("device", "STRING"),
+]
+
+def main(request=None):
 
     # Step one, fetch keyword data
     # Initialise variables
@@ -155,12 +180,38 @@ def main(request):
         "main_keyword_id"
     ].replace("None", np.nan)
 
-    # Exporting DataFrame to CSV with default handling of NaN values (empty strings) for testing purposes, remove this step.
-    keywords_augmented.to_csv("keywords_augmented.csv", index=False)
+    # Exporting DataFrame to CSV with default handling of NaN values (empty strings) for testing purposes
+    # keywords_augmented.to_csv("keywords_augmented.csv", index=False)
 
     # Step 4, fetch SERP data
     date_str = datetime.now().strftime("%Y-%m-%d")
 
+    # Additional step to try and clean out malformed data
+    def clean_data(df, schema):
+        # Fill missing values with appropriate defaults before type conversion
+        df = df.fillna({
+            'main_keyword_id': '',
+            'main_keyword': '',
+        })
+
+        # Strip leading/trailing spaces and remove hidden characters
+        # NOTE: applymap() is used here. If upgrading Pandas beyond version 1.3.3,
+        # switch to df.apply() or another suitable method if applymap() is deprecated.
+        df = df.applymap(lambda x: str(x).strip() if isinstance(x, str) else x)
+        
+        # Ensure data types match the schema
+        for field in schema:
+            if field.field_type == "INTEGER":
+                df[field.name] = pd.to_numeric(df[field.name], errors='coerce').fillna(0).astype(int)
+            elif field.field_type == "BOOL":
+                df[field.name] = df[field.name].astype(bool)
+            elif field.field_type == "DATE":
+                df[field.name] = pd.to_datetime(df[field.name], errors='coerce').dt.date
+            else:
+                df[field.name] = df[field.name].astype(str)
+        
+        return df
+    
     def fetch_and_process_serp_data(
         device_type,
         campaign_id,
@@ -168,12 +219,13 @@ def main(request):
         api_key,
         keywords_augmented,
         file_path,
+        schema,
         append=False,
     ):
         offset = 0
         limit = 100
         status_code = 200
-        max_offset = 10000  # Ridiculously high offset cap, just to be safe
+        max_offset = 10  # Ridiculously high offset cap, just to be safe
 
         # Initialize an empty DataFrame to accumulate results
         all_serp_flat = pd.DataFrame()
@@ -208,6 +260,25 @@ def main(request):
                 print(f"Received status code {status_code}, stopping...")
                 break
 
+        # Debugging prints to check columns before the merge
+        print("Columns in all_serp_flat:", all_serp_flat.columns)
+        print("Columns in keywords_augmented:", keywords_augmented.columns)
+
+        # Ensure all necessary columns are present in keywords_augmented
+        required_columns = ['keyword_id', 'keyword', 'main_keyword_id', 'search_data.search_volume',
+                            'variant_flag', 'group_name', 'parent_id', 'main_keyword']
+        for column in required_columns:
+            if column not in keywords_augmented.columns:
+                print(f"Warning: '{column}' column not found in keywords_augmented")
+                keywords_augmented[column] = ''
+
+        # Rename columns to match schema
+        column_renames = {
+            'search_data.search_volume': 'search_volume',
+            'parent_id': 'parent_group_id'
+        }
+        keywords_augmented = keywords_augmented.rename(columns=column_renames)
+
         # Process and join this data with keywords_augmented
         final_df = pd.merge(
             all_serp_flat, keywords_augmented, how="left", on="keyword_id"
@@ -215,14 +286,28 @@ def main(request):
         final_df["campaign_id"] = campaign_id
         final_df["date"] = date_str
         final_df["device"] = device_type.capitalize()
-        # Drop the 'keyword_y' column
-        final_df = final_df.drop(columns=['keyword_y'])
+
+        # Rename 'keyword_x' to 'keyword'
+        final_df = final_df.rename(columns={'keyword_x': 'keyword'})
+
+        # Drop the 'keyword_y' column if it exists
+        if 'keyword_y' in final_df.columns:
+            final_df = final_df.drop(columns=['keyword_y'])
+
+        # Clean the data
+        final_df = clean_data(final_df, schema)
+
+        # Fill NaN values with empty strings before writing to CSV
+        final_df = final_df.fillna('')
+
+        # Debugging print to check columns after the merge
+        print("Columns in final_df after merge:", final_df.columns)
 
         # Determine whether to append or write new
         if append:
-            final_df.to_csv(file_path, mode="a", index=False, header=False, na_rep="")
+            final_df.to_csv(file_path, mode="a", index=False, header=False, na_rep="", encoding='utf-8')
         else:
-            final_df.to_csv(file_path, index=False, header=False, na_rep="")
+            final_df.to_csv(file_path, index=False, header=False, na_rep="", encoding='utf-8')
         print(f"Completed fetching and saving all {device_type} data.")
 
     # Path for the CSV file, assuming it's the same for both desktop and mobile
@@ -230,14 +315,15 @@ def main(request):
 
     # Fetch and process desktop data, write to CSV without appending (creating the file or overwriting if it exists)
     fetch_and_process_serp_data(
-        "desktop",
-        campaign_id,
-        current_date,
-        api_key,
-        keywords_augmented,
-        file_path,
-        append=False,
-    )
+            "desktop",
+            campaign_id,
+            current_date,
+            api_key,
+            keywords_augmented,
+            file_path,
+            schema,
+            append=False,
+        )
 
     # Fetch and process mobile data, append to the existing CSV
     fetch_and_process_serp_data(
@@ -247,6 +333,7 @@ def main(request):
         api_key,
         keywords_augmented,
         file_path,
+        schema,
         append=True,
     )
 
@@ -282,27 +369,6 @@ def main(request):
     # Initialize a BigQuery client
     client = bigquery.Client(project=project_id)
 
-    # Manually define the schema
-    schema = [
-        bigquery.SchemaField("domain", "STRING"),
-        bigquery.SchemaField("rank", "INTEGER"),
-        bigquery.SchemaField("landing_page", "STRING"),
-        bigquery.SchemaField("title", "STRING"),
-        bigquery.SchemaField("description", "STRING"),
-        bigquery.SchemaField("search_intent", "STRING"),
-        bigquery.SchemaField("keyword_id", "STRING"),
-        bigquery.SchemaField("keyword", "STRING"),
-        bigquery.SchemaField("main_keyword_id", "STRING"),
-        bigquery.SchemaField("search_volume", "INTEGER"),
-        bigquery.SchemaField("variant_flag", "BOOL"),
-        bigquery.SchemaField("group_name", "STRING"),
-        bigquery.SchemaField("parent_group_id", "STRING"),
-        bigquery.SchemaField("main_keyword", "STRING"),
-        bigquery.SchemaField("campaign_id", "STRING"),
-        bigquery.SchemaField("date", "DATE"),
-        bigquery.SchemaField("device", "STRING"),
-    ]
-
     # Configure the load job
     job_config = bigquery.LoadJobConfig(
         autodetect=False,
@@ -310,7 +376,7 @@ def main(request):
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=0,
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        max_bad_records=10
+        max_bad_records=10 
     )
 
     # Start the load job
@@ -324,3 +390,6 @@ def main(request):
     except Exception as e:
         print(f"Failed to load data from {uri} into BigQuery: {e}")
         return "Process encountered an error"
+
+if __name__ == "__main__":
+    main()
