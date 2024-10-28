@@ -2,3 +2,4 @@
 Archives/
 .env
 *.json
+*.csv
